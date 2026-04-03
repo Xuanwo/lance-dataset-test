@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/bench-cli",
+  "crates/bench-core",
+  "crates/engine-lance",
+  "crates/engine-parquet",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4.5.23", features = ["derive"] }
+futures = "0.3"
+hdrhistogram = "7"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "time", "fs"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+arrow-array = "57.2.0"
+arrow-schema = "57.2.0"
+arrow-select = "57.2.0"
+parquet = "57.2.0"
+
+csv = "1"
+flate2 = "1"
+tar = "0.4"
+
+lance = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d", default-features = false }
+lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance-core = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance-file = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance-io = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance-index = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
