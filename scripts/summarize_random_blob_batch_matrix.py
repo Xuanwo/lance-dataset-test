@@ -73,6 +73,8 @@ def load_records(run_root: Path):
                 "requests": requests,
                 "selected_blobs": selected_blobs,
                 "materialized_blobs": materialized_blobs,
+                "raw_us_per_blob_uses_selected_rows": "us_per_selected_row"
+                not in params,
                 "trace_fingerprint": params["trace_fingerprint"],
                 "wall_time_us": wall_us,
                 "us_per_selected_row": wall_us / selected_blobs,
@@ -402,6 +404,7 @@ def write_report(
     materialized_group_count,
     byte_group_count,
     verification_count,
+    legacy_metric_count,
     sizes,
     plot_files,
 ):
@@ -421,6 +424,7 @@ def write_report(
         f"- Verified {materialized_group_count} workload/repetition groups returned identical non-null blob counts across engines and APIs.",
         f"- Verified {byte_group_count} workload/repetition groups materialized identical byte totals across engines and APIs.",
         f"- {verification_count} independent sampled full-content comparisons passed.",
+        f"- {legacy_metric_count} raw run JSON files use the legacy selected-row denominator in `params.us_per_blob`; this report and both CSV files recompute `µs/blob` from raw wall time and non-null materialized count.",
         "",
         "The complete, unrounded result set is in `per_run.csv`; repetition medians and min/max ranges are in `summary.csv`.",
         "",
@@ -668,6 +672,9 @@ def main():
     summary = aggregate(grouped)
     sizes = load_sizes(run_root)
     verification_count = validate_verification(run_root)
+    legacy_metric_count = sum(
+        record["raw_us_per_blob_uses_selected_rows"] for record in records
+    )
 
     write_csv(run_root / "per_run.csv", records)
     write_csv(run_root / "summary.csv", summary)
@@ -679,6 +686,7 @@ def main():
         "materialized_blob_groups_validated": materialized_group_count,
         "byte_groups_validated": byte_group_count,
         "verification_files": verification_count,
+        "legacy_raw_us_per_blob_records": legacy_metric_count,
         "missing_required_fields": 0,
         "duplicate_run_keys": 0,
         "batch_sizes": sorted({record["batch_size"] for record in records}),
@@ -704,6 +712,7 @@ def main():
         materialized_group_count,
         byte_group_count,
         verification_count,
+        legacy_metric_count,
         sizes,
         plot_files,
     )
