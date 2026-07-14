@@ -17,6 +17,7 @@ sudo dnf install -y \
   perl \
   pkgconf-pkg-config \
   protobuf-compiler \
+  protobuf-devel \
   python3 \
   python3-pip \
   xfsprogs
