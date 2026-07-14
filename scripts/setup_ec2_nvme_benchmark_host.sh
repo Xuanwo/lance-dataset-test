@@ -28,16 +28,20 @@ source "${HOME}/.cargo/env"
 rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
 rustup default "${RUST_TOOLCHAIN}"
 
-mapfile -t instance_store_links < <(
-  compgen -G '/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_*' || true
+mapfile -t instance_store_devices < <(
+  while IFS= read -r link; do
+    readlink -f "${link}"
+  done < <(
+    compgen -G '/dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_*' || true
+  ) | sort -u
 )
-if [[ ${#instance_store_links[@]} -ne 1 ]]; then
+if [[ ${#instance_store_devices[@]} -ne 1 ]]; then
   printf 'expected exactly one EC2 NVMe instance-store device, found %s\n' \
-    "${#instance_store_links[@]}" >&2
+    "${#instance_store_devices[@]}" >&2
   exit 1
 fi
 
-device="$(readlink -f "${instance_store_links[0]}")"
+device="${instance_store_devices[0]}"
 if [[ -z "${device}" || ! -b "${device}" ]]; then
   printf 'invalid instance-store device: %s\n' "${device}" >&2
   exit 1
