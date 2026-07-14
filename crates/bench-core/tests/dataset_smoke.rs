@@ -33,6 +33,7 @@ async fn parquet_dir_gets_row_id() {
         DatasetReadOptions {
             batch_size: 1024,
             limit_rows: None,
+            row_id_offset: 0,
         },
     )
     .await
@@ -77,6 +78,7 @@ async fn openvid_adds_fake_blob_column() {
         DatasetReadOptions {
             batch_size: 1024,
             limit_rows: None,
+            row_id_offset: 0,
         },
     )
     .await
@@ -115,6 +117,7 @@ async fn webdataset_tar_smoke() {
         DatasetReadOptions {
             batch_size: 4,
             limit_rows: None,
+            row_id_offset: 0,
         },
     )
     .await

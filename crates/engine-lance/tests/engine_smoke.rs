@@ -33,7 +33,10 @@ async fn lance_ingest_and_scan_smoke() {
         .ingest(reader, &out, engine_lance::IngestOptions::default())
         .await
         .unwrap();
-    let (rows, _bytes) = engine.scan_count_rows(&out, None, None, 1).await.unwrap();
+    let (rows, _bytes) = engine
+        .scan_count_rows(&out, None, None, None, None, 1)
+        .await
+        .unwrap();
     assert_eq!(rows, 3);
 }
 

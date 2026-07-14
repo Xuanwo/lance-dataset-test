@@ -110,6 +110,21 @@ enum LanceWriteModeArg {
     Overwrite,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BlobOpenModeArg {
+    Opened,
+    Reopen,
+}
+
+impl BlobOpenModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Reopen => "reopen",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "bench")]
 struct Cli {
@@ -283,6 +298,8 @@ enum Command {
         column: String,
         #[arg(long, default_value_t = 1000)]
         iters: u64,
+        #[arg(long, value_enum, default_value = "opened")]
+        open_mode: BlobOpenModeArg,
         #[arg(long)]
         result_out: Option<String>,
     },
@@ -501,15 +518,7 @@ async fn main() -> Result<()> {
             result_out,
         } => {
             run_scan(
-                cli.seed,
-                engine,
-                dataset,
-                path,
-                mode,
-                projection,
-                limit_rows,
-                row_offset,
-                repeats,
+                cli.seed, engine, dataset, path, mode, projection, limit_rows, row_offset, repeats,
                 result_out,
             )
             .await
@@ -533,8 +542,14 @@ async fn main() -> Result<()> {
             path,
             column,
             iters,
+            open_mode,
             result_out,
-        } => run_blob(cli.seed, engine, dataset, path, column, iters, result_out).await,
+        } => {
+            run_blob(
+                cli.seed, engine, dataset, path, column, iters, open_mode, result_out,
+            )
+            .await
+        }
         Command::Evolve {
             engine,
             dataset,
@@ -1075,13 +1090,11 @@ async fn run_suite(
             .await?;
         }
 
-        for (engine, engine_tag, path) in [
-            (
-                EngineArg::Parquet,
-                "parquet".to_string(),
-                parquet_out.to_string_lossy().to_string(),
-            ),
-        ] {
+        for (engine, engine_tag, path) in [(
+            EngineArg::Parquet,
+            "parquet".to_string(),
+            parquet_out.to_string_lossy().to_string(),
+        )] {
             let engine_name: EngineName = engine.clone().into();
             for (mode, mode_tag) in [
                 (ScanModeArg::Full, "scan-full"),
@@ -1218,6 +1231,7 @@ async fn run_suite(
                                 path,
                                 col,
                                 blob_iters,
+                                BlobOpenModeArg::Opened,
                                 Some(result_out),
                             )
                             .await
@@ -1425,6 +1439,7 @@ async fn run_suite(
                                 path,
                                 col,
                                 blob_iters,
+                                BlobOpenModeArg::Opened,
                                 Some(result_out),
                             )
                             .await
@@ -1840,7 +1855,17 @@ async fn run_dispatch(
         WorkloadArg::RandomBlob => {
             let column =
                 column.ok_or_else(|| anyhow::anyhow!("--column is required for random-blob"))?;
-            run_blob(seed, engine, dataset, path, column, iters, Some(out)).await
+            run_blob(
+                seed,
+                engine,
+                dataset,
+                path,
+                column,
+                iters,
+                BlobOpenModeArg::Opened,
+                Some(out),
+            )
+            .await
         }
         WorkloadArg::EvolutionBackfill => {
             let new_column = new_column.ok_or_else(|| {
@@ -2372,6 +2397,7 @@ async fn run_blob(
     path: String,
     column: String,
     iters: u64,
+    open_mode: BlobOpenModeArg,
     result_out: Option<String>,
 ) -> Result<()> {
     let started_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -2389,6 +2415,16 @@ async fn run_blob(
     } else {
         None
     };
+    let parquet_file = if matches!(engine, EngineArg::Parquet) {
+        Some(
+            parquet_engine
+                .open_file(std::path::Path::new(&path))
+                .await
+                .context("open parquet file")?,
+        )
+    } else {
+        None
+    };
     let row_count = match engine {
         EngineArg::Lance => {
             lance_dataset
@@ -2400,10 +2436,9 @@ async fn run_blob(
         EngineArg::LanceFragment => {
             anyhow::bail!("engine lance-fragment supports scan workloads only")
         }
-        EngineArg::Parquet => parquet_engine
-            .open_file(std::path::Path::new(&path))
-            .await
-            .context("open parquet file")?
+        EngineArg::Parquet => parquet_file
+            .as_ref()
+            .expect("parquet file must be opened")
             .row_count(),
     };
 
@@ -2416,57 +2451,6 @@ async fn run_blob(
     });
     let lance_file_version = lance_file_version.transpose()?;
 
-    if matches!(engine, EngineArg::Lance) && lance_file_version.as_deref() == Some("2.2") {
-        let dataset_for_probe = lance_dataset
-            .as_ref()
-            .expect("lance dataset must be opened")
-            .clone();
-        let column_for_probe = column.clone();
-        let probe = tokio::spawn(async move {
-            engine_lance::LanceEngine::new()
-                .take_blob_one_opened(&dataset_for_probe, 0, &column_for_probe)
-                .await
-        })
-        .await;
-
-        match probe {
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(join_err) => {
-                let timing = WallTimer::start().stop();
-                let engine_name: EngineName = engine.clone().into();
-                let dataset_name: DatasetName = dataset.into();
-                let mut params = BTreeMap::new();
-                let path_for_index = path.clone();
-                params.insert("path".to_string(), path);
-                maybe_add_lance_index_params(engine_name, &path_for_index, &mut params);
-                params.insert("iters".to_string(), iters.to_string());
-                params.insert("row_count".to_string(), row_count.to_string());
-                params.insert("column".to_string(), column);
-                if let Some(v) = lance_file_version {
-                    params.insert("lance_file_version".to_string(), v);
-                }
-                let result = RunResult {
-                    meta: make_meta(
-                        engine_name,
-                        dataset_name,
-                        Workload::RandomBlob,
-                        seed,
-                        started_at_unix_ms,
-                        params,
-                    ),
-                    timing,
-                    rows: Some(iters),
-                    bytes: Some(0),
-                    latency: None,
-                    notes: vec![format!("panic: {join_err}")],
-                };
-                write_result(&result, result_out).await?;
-                return Ok(());
-            }
-        }
-    }
-
     let mut histogram = Histogram::<u64>::new(3)?;
     let timer = WallTimer::start();
     let mut bytes = 0u64;
@@ -2478,18 +2462,37 @@ async fn run_blob(
                 let dataset = lance_dataset
                     .as_ref()
                     .expect("lance dataset must be opened before iteration");
-                lance_engine
-                    .take_blob_one_opened(dataset, row_offset, &column)
-                    .await? as u64
+                match open_mode {
+                    BlobOpenModeArg::Opened => {
+                        lance_engine
+                            .take_blob_one_opened(dataset, row_offset, &column)
+                            .await? as u64
+                    }
+                    BlobOpenModeArg::Reopen => {
+                        lance_engine
+                            .take_blob_one(std::path::Path::new(&path), row_offset, &column)
+                            .await? as u64
+                    }
+                }
             }
             EngineArg::LanceFragment => {
                 anyhow::bail!("engine lance-fragment supports scan workloads only")
             }
-            EngineArg::Parquet => {
-                parquet_engine
-                    .take_binary_one(std::path::Path::new(&path), row_offset, &column)
-                    .await? as u64
-            }
+            EngineArg::Parquet => match open_mode {
+                BlobOpenModeArg::Opened => {
+                    let file = parquet_file
+                        .as_ref()
+                        .expect("parquet file must be opened before iteration");
+                    parquet_engine
+                        .take_binary_one_opened(file, row_offset, &column)
+                        .await? as u64
+                }
+                BlobOpenModeArg::Reopen => {
+                    parquet_engine
+                        .take_binary_one(std::path::Path::new(&path), row_offset, &column)
+                        .await? as u64
+                }
+            },
         };
         bytes = bytes.saturating_add(nbytes);
         let elapsed_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -2506,6 +2509,7 @@ async fn run_blob(
     params.insert("iters".to_string(), iters.to_string());
     params.insert("row_count".to_string(), row_count.to_string());
     params.insert("column".to_string(), column.clone());
+    params.insert("open_mode".to_string(), open_mode.as_str().to_string());
     if let Some(v) = lance_file_version {
         params.insert("lance_file_version".to_string(), v);
     }

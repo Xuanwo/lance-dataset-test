@@ -8,11 +8,12 @@ use lance::dataset::fragment::FileFragment;
 use lance::dataset::NewColumnTransform;
 pub use lance::dataset::ProjectionRequest;
 use lance::dataset::{WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
 pub use lance::Dataset;
 use lance_datafusion::exec::{new_session_context, LanceExecutionOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 
 use arrow_array::RecordBatchReader;
 use bench_core::metrics::{LatencySummary, Timing, WallTimer};
@@ -20,7 +21,7 @@ use bench_core::query::Filter;
 use hdrhistogram::Histogram;
 
 pub const ENGINE_ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const LANCE_DEP_VERSION: &str = "58f3b84";
+pub const LANCE_DEP_VERSION: &str = "09174bc";
 
 pub struct LanceEngine;
 
@@ -169,7 +170,8 @@ impl LanceEngine {
     ) -> Result<()> {
         let uri = dataset_path.to_string_lossy().to_string();
         let mut dataset = Dataset::open(&uri).await?;
-        self.ensure_scalar_btree_indices(&mut dataset, columns).await
+        self.ensure_scalar_btree_indices(&mut dataset, columns)
+            .await
     }
 
     pub async fn fragment_count(&self, dataset_path: &Path) -> Result<u64> {

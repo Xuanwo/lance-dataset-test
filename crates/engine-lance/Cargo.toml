@@ -23,7 +23,7 @@ lance-core.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
 lance-index.workspace = true
-datafusion = { version = "52.1.0", default-features = false }
+datafusion = { version = "53.1.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

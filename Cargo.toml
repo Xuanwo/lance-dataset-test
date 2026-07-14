@@ -27,20 +27,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 
-arrow-array = "57.2.0"
-arrow-schema = "57.2.0"
-arrow-select = "57.2.0"
-parquet = "57.2.0"
+arrow-array = "=58.3.0"
+arrow-schema = "=58.3.0"
+arrow-select = "=58.3.0"
+parquet = "=58.3.0"
 
 csv = "1"
 flate2 = "1"
 tar = "0.4"
 
-lance = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d", default-features = false }
-lance-arrow = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
-lance-core = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
-lance-datafusion = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
-lance-encoding = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
-lance-file = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
-lance-io = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
-lance-index = { git = "https://github.com/lancedb/lance.git", rev = "58f3b844b1f5a8aae369b954782db623030f9c6d" }
+lance = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6", default-features = false }
+lance-arrow = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }
+lance-core = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }
+lance-datafusion = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }
+lance-encoding = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }
+lance-file = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }
+lance-io = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }
+lance-index = { git = "https://github.com/lance-format/lance.git", rev = "09174bc9f49e372c1e8c13b73c4e21207150faa6" }

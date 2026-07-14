@@ -16,7 +16,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReader
 use parquet::arrow::{ArrowWriter, ProjectionMask};
 
 pub const ENGINE_ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PARQUET_DEP_VERSION: &str = "57.2.0";
+pub const PARQUET_DEP_VERSION: &str = "58.3.0";
 
 pub struct ParquetEngine;
 

@@ -39,11 +39,19 @@ for attempt in $(seq 1 "${HF_MAX_RETRIES:-20}"); do
 
   set -e
   set +e
-  cargo run -q -p bench-cli -- prepare-openvid \
-    --input "${RAW_DIR}/${CSV_REL_PATH}" \
-    --out "${OUT_DIR}" \
-    --limit-rows "${TARGET_ROWS}" \
-    --batch-size 8192
+  if [[ -n "${BENCH_BIN:-}" ]]; then
+    "${BENCH_BIN}" prepare-openvid \
+      --input "${RAW_DIR}/${CSV_REL_PATH}" \
+      --out "${OUT_DIR}" \
+      --limit-rows "${TARGET_ROWS}" \
+      --batch-size 8192
+  else
+    cargo run -q -p bench-cli -- prepare-openvid \
+      --input "${RAW_DIR}/${CSV_REL_PATH}" \
+      --out "${OUT_DIR}" \
+      --limit-rows "${TARGET_ROWS}" \
+      --batch-size 8192
+  fi
   status=$?
   set -e
   rm -rf "${RAW_DIR}" || true
