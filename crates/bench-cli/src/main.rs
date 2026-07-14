@@ -3305,9 +3305,18 @@ async fn run_blob_batch(
         materialized_blobs.to_string(),
     );
     params.insert(
-        "us_per_blob".to_string(),
+        "us_per_selected_row".to_string(),
         format!("{:.3}", timing.wall_time_us as f64 / selected_blobs as f64),
     );
+    if materialized_blobs > 0 {
+        params.insert(
+            "us_per_blob".to_string(),
+            format!(
+                "{:.3}",
+                timing.wall_time_us as f64 / materialized_blobs as f64
+            ),
+        );
+    }
     params.insert(
         "content_consumption".to_string(),
         "full-payload-length".to_string(),

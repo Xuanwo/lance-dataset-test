@@ -53,6 +53,9 @@ def load_records(run_root: Path):
         if params["content_consumption"] != "full-payload-length":
             raise ValueError(f"unexpected content consumption in {path.name}")
         wall_us = int(payload["timing"]["wall_time_us"])
+        materialized_blobs = int(params["materialized_blobs"])
+        if materialized_blobs == 0:
+            raise ValueError(f"no non-null blob payloads materialized in {path.name}")
         records.append(
             {
                 "file": path.name,
@@ -69,10 +72,11 @@ def load_records(run_root: Path):
                 "seed": int(payload["meta"]["seed"]),
                 "requests": requests,
                 "selected_blobs": selected_blobs,
-                "materialized_blobs": int(params["materialized_blobs"]),
+                "materialized_blobs": materialized_blobs,
                 "trace_fingerprint": params["trace_fingerprint"],
                 "wall_time_us": wall_us,
-                "us_per_blob": wall_us / selected_blobs,
+                "us_per_selected_row": wall_us / selected_blobs,
+                "us_per_blob": wall_us / materialized_blobs,
                 "batch_p50_us": int(payload["latency"]["p50_us"]),
                 "batch_p95_us": int(payload["latency"]["p95_us"]),
                 "batch_p99_us": int(payload["latency"]["p99_us"]),
@@ -111,6 +115,7 @@ def validate_records(records, expected_repetitions):
         raise ValueError(f"duplicate result keys: {duplicates[:3]}")
 
     trace_groups = defaultdict(set)
+    materialized_groups = defaultdict(set)
     byte_groups = defaultdict(set)
     for record in records:
         workload_key = (
@@ -122,11 +127,20 @@ def validate_records(records, expected_repetitions):
             record["repetition"],
         )
         trace_groups[workload_key].add(record["trace_fingerprint"])
+        materialized_groups[workload_key].add(record["materialized_blobs"])
         byte_groups[workload_key].add(record["bytes"])
     bad_traces = {key: value for key, value in trace_groups.items() if len(value) != 1}
+    bad_materialized = {
+        key: value for key, value in materialized_groups.items() if len(value) != 1
+    }
     bad_bytes = {key: value for key, value in byte_groups.items() if len(value) != 1}
     if bad_traces:
         raise ValueError(f"row trace mismatch across engines/APIs: {list(bad_traces.items())[:3]}")
+    if bad_materialized:
+        raise ValueError(
+            "materialized blob count mismatch across engines/APIs: "
+            f"{list(bad_materialized.items())[:3]}"
+        )
     if bad_bytes:
         raise ValueError(f"materialized byte mismatch across engines/APIs: {list(bad_bytes.items())[:3]}")
 
@@ -143,7 +157,7 @@ def validate_records(records, expected_repetitions):
             f"incomplete repetitions: expected={expected_repetitions} "
             f"examples={list(bad_repetitions.items())[:5]}"
         )
-    return grouped, len(trace_groups), len(byte_groups)
+    return grouped, len(trace_groups), len(materialized_groups), len(byte_groups)
 
 
 def aggregate(grouped):
@@ -155,9 +169,28 @@ def aggregate(grouped):
                 "repetitions": len(values),
                 "requests_per_run": values[0]["requests"],
                 "selected_blobs_per_run": values[0]["selected_blobs"],
-                "materialized_blobs_per_run": values[0]["materialized_blobs"],
-                "bytes_per_run": values[0]["bytes"],
+                "median_materialized_blobs_per_run": median(
+                    [value["materialized_blobs"] for value in values]
+                ),
+                "min_materialized_blobs_per_run": min(
+                    value["materialized_blobs"] for value in values
+                ),
+                "max_materialized_blobs_per_run": max(
+                    value["materialized_blobs"] for value in values
+                ),
+                "median_bytes_per_run": median([value["bytes"] for value in values]),
+                "min_bytes_per_run": min(value["bytes"] for value in values),
+                "max_bytes_per_run": max(value["bytes"] for value in values),
                 "median_wall_time_us": median([value["wall_time_us"] for value in values]),
+                "median_us_per_selected_row": median(
+                    [value["us_per_selected_row"] for value in values]
+                ),
+                "min_us_per_selected_row": min(
+                    value["us_per_selected_row"] for value in values
+                ),
+                "max_us_per_selected_row": max(
+                    value["us_per_selected_row"] for value in values
+                ),
                 "median_us_per_blob": median([value["us_per_blob"] for value in values]),
                 "min_us_per_blob": min(value["us_per_blob"] for value in values),
                 "max_us_per_blob": max(value["us_per_blob"] for value in values),
@@ -293,9 +326,10 @@ def plot_curves(run_root: Path, summary):
                 ax.plot(x, y, marker=marker, label=label, color=colors[label], linewidth=2)
                 ax.fill_between(x, low, high, color=colors[label], alpha=0.10)
             ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
             ax.set_xticks([1, 4, 16, 64], ["1", "4", "16", "64"])
-            ax.set_xlabel("Business batch size (blobs)")
-            ax.set_ylabel("Median wall time per blob (µs/blob)")
+            ax.set_xlabel("Business batch size (row selectors)")
+            ax.set_ylabel("Median wall time per materialized blob (µs/blob, log scale)")
             ax.set_title(f"{dataset}: batch amortization, C=1, {distribution}")
             ax.grid(True, axis="y", alpha=0.25)
             ax.legend(frameon=False, fontsize=8)
@@ -343,9 +377,10 @@ def plot_curves(run_root: Path, summary):
                     linewidth=2,
                 )
             ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
             ax.set_xticks([1, 8, 32], ["1", "8", "32"])
             ax.set_xlabel("Concurrent business requests")
-            ax.set_ylabel("Median batch latency (ms)")
+            ax.set_ylabel("Median batch latency (ms, log scale)")
             ax.set_title(f"{dataset}: request concurrency, B=16, {distribution}")
             ax.grid(True, axis="y", alpha=0.25)
             ax.legend(frameon=False, fontsize=8)
@@ -360,7 +395,16 @@ def plot_curves(run_root: Path, summary):
     return outputs
 
 
-def write_report(run_root: Path, summary, trace_group_count, byte_group_count, verification_count, sizes, plot_files):
+def write_report(
+    run_root: Path,
+    summary,
+    trace_group_count,
+    materialized_group_count,
+    byte_group_count,
+    verification_count,
+    sizes,
+    plot_files,
+):
     index = summary_index(summary)
     lines = [
         "# Lance v2.2 vs Parquet batched blob benchmark",
@@ -371,8 +415,10 @@ def write_report(run_root: Path, summary, trace_group_count, byte_group_count, v
         "- Lance `planned-read-blobs` performs one `read_blobs(...).execute()` per business batch.",
         "- Parquet performs one reader builder plus one whole-batch `RowSelection` per business batch.",
         "- All implementations materialize full payloads and consume payload lengths inside the timed request.",
+        "- `B` is the number of row selectors in a business request. `µs/blob` divides by non-null payloads actually materialized; `µs/selected row` is retained in the CSV files.",
         "- Parquet default and layout files use Arrow Parquet writer default encodings. The layout file only changes write batching, row-group bytes, and offset-index/page layout.",
         f"- Verified {trace_group_count} workload/repetition groups had identical trace fingerprints across engines and APIs.",
+        f"- Verified {materialized_group_count} workload/repetition groups returned identical non-null blob counts across engines and APIs.",
         f"- Verified {byte_group_count} workload/repetition groups materialized identical byte totals across engines and APIs.",
         f"- {verification_count} independent sampled full-content comparisons passed.",
         "",
@@ -387,6 +433,36 @@ def write_report(run_root: Path, summary, trace_group_count, byte_group_count, v
         lines.append(
             f"| {row['dataset']} | {row['implementation']} | {row['bytes'] / 2**30:.3f} |"
         )
+
+    lines.extend(
+        [
+            "",
+            "## Payload coverage at B=16, C=1",
+            "",
+            "LAION WebDataset rows can have a null `image`. Those rows still participate in the same selector trace and batch latency, but are excluded from the `µs/blob` denominator because no payload exists.",
+            "",
+            "| Dataset | Distribution | Selected rows/run | Median materialized blobs/run | Coverage |",
+            "|---|---|---:|---:|---:|",
+        ]
+    )
+    for dataset in ["open_vid", "laion10m"]:
+        for distribution in ["uniform", "ann-top-k"]:
+            row = lookup(
+                index,
+                dataset,
+                "lance-v2.2",
+                "planned-read-blobs",
+                "indices",
+                "preserve",
+                distribution,
+                16,
+                1,
+            )
+            selected = row["selected_blobs_per_run"]
+            materialized = row["median_materialized_blobs_per_run"]
+            lines.append(
+                f"| {dataset} | {distribution} | {selected} | {materialized:.0f} | {materialized / selected:.1%} |"
+            )
 
     for dataset in ["open_vid", "laion10m"]:
         for distribution in ["uniform", "ann-top-k"]:
@@ -575,7 +651,7 @@ def main():
     expected_repetitions = int(environment["repetitions"])
 
     records = load_records(run_root)
-    grouped, trace_group_count, byte_group_count = validate_records(
+    grouped, trace_group_count, materialized_group_count, byte_group_count = validate_records(
         records, expected_repetitions
     )
     summary = aggregate(grouped)
@@ -589,6 +665,7 @@ def main():
         "aggregate_groups": len(summary),
         "expected_repetitions": expected_repetitions,
         "trace_groups_validated": trace_group_count,
+        "materialized_blob_groups_validated": materialized_group_count,
         "byte_groups_validated": byte_group_count,
         "verification_files": verification_count,
         "missing_required_fields": 0,
@@ -602,6 +679,10 @@ def main():
             min(record["us_per_blob"] for record in records),
             max(record["us_per_blob"] for record in records),
         ],
+        "us_per_selected_row_range": [
+            min(record["us_per_selected_row"] for record in records),
+            max(record["us_per_selected_row"] for record in records),
+        ],
     }
     (run_root / "DATA_QUALITY.json").write_text(json.dumps(quality, indent=2) + "\n")
     plot_files = plot_curves(run_root, summary)
@@ -609,6 +690,7 @@ def main():
         run_root,
         summary,
         trace_group_count,
+        materialized_group_count,
         byte_group_count,
         verification_count,
         sizes,
