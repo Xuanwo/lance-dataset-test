@@ -3124,6 +3124,18 @@ async fn run_blob_batch(
 
     let preserve_order = ordering.preserve_order();
     let in_flight = request_concurrency.min(requests);
+    let parquet_handle_pool =
+        if matches!(engine, EngineArg::Parquet) && matches!(open_mode, BlobOpenModeArg::Opened) {
+            let opened = parquet_file.as_ref().expect("Parquet file is opened");
+            let mut handles = Vec::with_capacity(in_flight);
+            handles.push(opened.clone());
+            for _ in 1..in_flight {
+                handles.push(Arc::new(opened.try_clone_independent()?));
+            }
+            Some(Arc::new(tokio::sync::Mutex::new(handles)))
+        } else {
+            None
+        };
     let mut histogram = Histogram::<u64>::new(3)?;
     let mut selected_blobs = 0u64;
     let mut materialized_blobs = 0u64;
@@ -3182,15 +3194,23 @@ async fn run_blob_batch(
             }
         }
         EngineArg::Parquet => {
-            let opened = parquet_file.as_ref().expect("Parquet file is opened");
+            let handle_pool = parquet_handle_pool.as_ref();
             let mut pending = stream::iter(logical_trace.iter())
                 .map(|rows| async move {
                     let start = std::time::Instant::now();
                     let read = match open_mode {
                         BlobOpenModeArg::Opened => {
-                            engine_parquet::ParquetEngine::new()
-                                .read_binary_batch_opened(opened, rows, column_ref, preserve_order)
-                                .await?
+                            let handle_pool = handle_pool.expect("opened mode has a handle pool");
+                            let opened = handle_pool
+                                .lock()
+                                .await
+                                .pop()
+                                .context("Parquet handle pool unexpectedly empty")?;
+                            let read = engine_parquet::ParquetEngine::new()
+                                .read_binary_batch_opened(&opened, rows, column_ref, preserve_order)
+                                .await;
+                            handle_pool.lock().await.push(opened);
+                            read?
                         }
                         BlobOpenModeArg::Reopen => {
                             let reopened = engine_parquet::ParquetEngine::new()

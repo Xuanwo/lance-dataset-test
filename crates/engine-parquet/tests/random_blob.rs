@@ -60,6 +60,13 @@ async fn row_selection_reads_exact_binary_value_from_default_file() {
         .await
         .unwrap();
     assert_eq!(unordered, batch);
+    let second_handle = opened.try_clone_independent().unwrap();
+    let (first, second) = tokio::join!(
+        engine.read_binary_batch_opened(&opened, &[3, 0], "blob", true),
+        engine.read_binary_batch_opened(&second_handle, &[2, 1], "blob", false),
+    );
+    assert_eq!(first.unwrap().total_bytes, 9);
+    assert_eq!(second.unwrap().total_bytes, 7);
     assert_eq!(
         engine
             .read_binary_one_opened(&opened, 2, "blob")

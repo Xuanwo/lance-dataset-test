@@ -136,6 +136,7 @@ pub struct BlobBatchRead {
 }
 
 pub struct OpenedParquetFile {
+    path: std::path::PathBuf,
     file: File,
     metadata: ArrowReaderMetadata,
     row_group_start_rows: Vec<u64>,
@@ -201,6 +202,7 @@ impl ParquetEngine {
             }
 
             Ok(OpenedParquetFile {
+                path,
                 file,
                 metadata,
                 row_group_start_rows,
@@ -791,6 +793,20 @@ enum BinaryRead {
 }
 
 impl OpenedParquetFile {
+    pub fn try_clone_independent(&self) -> Result<Self> {
+        let file = File::open(&self.path)
+            .with_context(|| format!("open independent handle for {}", self.path.display()))?;
+        Ok(Self {
+            path: self.path.clone(),
+            file,
+            metadata: self.metadata.clone(),
+            row_group_start_rows: self.row_group_start_rows.clone(),
+            root_name_to_index: self.root_name_to_index.clone(),
+            read_mode: self.read_mode,
+            writer_profile: self.writer_profile,
+        })
+    }
+
     pub fn row_count(&self) -> u64 {
         self.metadata.metadata().file_metadata().num_rows() as u64
     }
