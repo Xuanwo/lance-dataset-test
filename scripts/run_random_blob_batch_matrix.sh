@@ -98,16 +98,19 @@ for dataset in openvid laion10m; do
   done
 
   layout_path="${DATASET_DIR}/${dataset}.default-encoding-layout.parquet"
-  "${BIN}" ingest \
-    --engine parquet \
-    --dataset "${dataset_args[${dataset}]}" \
-    --input "${inputs[${dataset}]}" \
-    --out "${layout_path}" \
-    --batch-size 8192 \
-    --limit-rows "${rows[${dataset}]}" \
-    --parquet-writer-profile random-blob \
-    --result-out "${JSON_DIR}/ingest.${dataset}.parquet-default-encoding-layout.json" \
-    > "${LOG_DIR}/ingest.${dataset}.parquet-default-encoding-layout.log" 2>&1
+  ingest_result="${JSON_DIR}/ingest.${dataset}.parquet-default-encoding-layout.json"
+  if [[ ! -s "${layout_path}" || ! -s "${ingest_result}" ]]; then
+    "${BIN}" ingest \
+      --engine parquet \
+      --dataset "${dataset_args[${dataset}]}" \
+      --input "${inputs[${dataset}]}" \
+      --out "${layout_path}" \
+      --batch-size 8192 \
+      --limit-rows "${rows[${dataset}]}" \
+      --parquet-writer-profile random-blob \
+      --result-out "${ingest_result}" \
+      > "${LOG_DIR}/ingest.${dataset}.parquet-default-encoding-layout.log" 2>&1
+  fi
 
   "${BIN}" --seed "$((SEED_BASE + 99))" verify-blob \
     --dataset "${dataset_args[${dataset}]}" \
@@ -281,6 +284,10 @@ run_case() {
   local trace_args=()
   if [[ "${distribution}" == ann-top-k ]]; then
     trace_args=(--trace-file "${TRACE_DIR}/${dataset}.sift-exact-top64.json")
+  fi
+
+  if [[ -s "${result}" ]] && jq -e '.rows != null and .bytes != null and .latency.p50_us != null' "${result}" > /dev/null; then
+    return
   fi
 
   drop_page_cache
