@@ -17,6 +17,7 @@ clap.workspace = true
 csv.workspace = true
 engine-lance = { path = "../engine-lance" }
 engine-parquet = { path = "../engine-parquet" }
+futures.workspace = true
 hdrhistogram.workspace = true
 parquet.workspace = true
 rand.workspace = true

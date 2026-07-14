@@ -48,6 +48,18 @@ async fn row_selection_reads_exact_binary_value_from_default_file() {
     assert!(opened.has_offset_index());
     assert_eq!(opened.writer_profile(), ParquetWriterProfile::Default);
     assert_eq!(opened.row_count(), 4);
+    let batch = engine
+        .read_binary_batch_opened(&opened, &[3, 0, 2], "blob", true)
+        .await
+        .unwrap();
+    assert_eq!(batch.selected_blobs, 3);
+    assert_eq!(batch.materialized_blobs, 3);
+    assert_eq!(batch.total_bytes, 16);
+    let unordered = engine
+        .read_binary_batch_opened(&opened, &[3, 0, 2], "blob", false)
+        .await
+        .unwrap();
+    assert_eq!(unordered, batch);
     assert_eq!(
         engine
             .read_binary_one_opened(&opened, 2, "blob")

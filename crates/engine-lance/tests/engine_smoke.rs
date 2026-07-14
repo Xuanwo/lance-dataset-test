@@ -99,4 +99,41 @@ async fn lance_v2_2_blob_ingest_and_take_smoke() {
     assert_eq!(len0, 3);
     let len2 = engine.take_blob_one(&out, 2, "blob").await.unwrap();
     assert_eq!(len2, 2);
+
+    let opened = engine.open_dataset(&out).await.unwrap();
+    let indices = [2, 0, 1];
+    let addresses = engine
+        .row_indices_to_addresses_opened(&opened, &indices)
+        .await
+        .unwrap();
+    for (selector, rows) in [
+        (engine_lance::BlobSelector::Indices, indices.as_slice()),
+        (engine_lance::BlobSelector::Addresses, addresses.as_slice()),
+    ] {
+        for api in [
+            engine_lance::BlobReadApi::SingletonTake,
+            engine_lance::BlobReadApi::BatchedTake,
+            engine_lance::BlobReadApi::PlannedRead,
+        ] {
+            let read = engine
+                .read_blob_batch_opened(&opened, rows, "blob", selector, api, true)
+                .await
+                .unwrap();
+            assert_eq!(read.selected_blobs, 3);
+            assert_eq!(read.materialized_blobs, 3);
+            assert_eq!(read.total_bytes, 5);
+        }
+    }
+    let unordered = engine
+        .read_blob_batch_opened(
+            &opened,
+            &indices,
+            "blob",
+            engine_lance::BlobSelector::Indices,
+            engine_lance::BlobReadApi::PlannedRead,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unordered.total_bytes, 5);
 }

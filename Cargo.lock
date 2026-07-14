@@ -868,6 +868,7 @@ dependencies = [
  "csv",
  "engine-lance",
  "engine-parquet",
+ "futures",
  "hdrhistogram",
  "parquet",
  "plotters",

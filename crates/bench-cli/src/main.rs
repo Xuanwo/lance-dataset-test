@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use bench_core::result::{RunMetadata, RunResult};
 use bench_core::workload::{DatasetName, EngineName, Workload};
 use bench_core::{dataset, fs};
 use clap::{Parser, ValueEnum};
+use futures::{stream, StreamExt};
 use hdrhistogram::Histogram;
 use parquet::arrow::ArrowWriter;
 use rand::prelude::*;
@@ -121,6 +122,83 @@ impl BlobOpenModeArg {
         match self {
             Self::Opened => "opened",
             Self::Reopen => "reopen",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BlobSelectorArg {
+    Indices,
+    Addresses,
+}
+
+impl BlobSelectorArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Indices => "indices",
+            Self::Addresses => "addresses",
+        }
+    }
+}
+
+impl From<BlobSelectorArg> for engine_lance::BlobSelector {
+    fn from(value: BlobSelectorArg) -> Self {
+        match value {
+            BlobSelectorArg::Indices => Self::Indices,
+            BlobSelectorArg::Addresses => Self::Addresses,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BlobBatchApiArg {
+    SingletonTake,
+    BatchedTake,
+    PlannedReadBlobs,
+    ParquetRowSelection,
+}
+
+impl BlobBatchApiArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SingletonTake => "singleton-take",
+            Self::BatchedTake => "batched-take",
+            Self::PlannedReadBlobs => "planned-read-blobs",
+            Self::ParquetRowSelection => "parquet-row-selection",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BlobOrderingArg {
+    Preserve,
+    Unordered,
+}
+
+impl BlobOrderingArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Unordered => "unordered",
+        }
+    }
+
+    fn preserve_order(self) -> bool {
+        self == Self::Preserve
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BlobDistributionArg {
+    Uniform,
+    AnnTopK,
+}
+
+impl BlobDistributionArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::AnnTopK => "ann-top-k",
         }
     }
 }
@@ -355,6 +433,39 @@ enum Command {
         open_mode: BlobOpenModeArg,
         #[arg(long, value_enum, default_value = "sequential")]
         parquet_read_mode: ParquetReadModeArg,
+        #[arg(long, value_enum, default_value = "default")]
+        parquet_writer_profile: ParquetWriterProfileArg,
+        #[arg(long)]
+        result_out: Option<String>,
+    },
+    #[command(name = "blob-batch")]
+    BlobBatch {
+        #[arg(long)]
+        engine: EngineArg,
+        #[arg(long)]
+        dataset: DatasetArg,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        column: String,
+        #[arg(long, default_value_t = 64)]
+        requests: usize,
+        #[arg(long, default_value_t = 16)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 1)]
+        request_concurrency: usize,
+        #[arg(long, value_enum, default_value = "indices")]
+        selector: BlobSelectorArg,
+        #[arg(long, value_enum, default_value = "preserve")]
+        ordering: BlobOrderingArg,
+        #[arg(long, value_enum, default_value = "planned-read-blobs")]
+        api: BlobBatchApiArg,
+        #[arg(long, value_enum, default_value = "uniform")]
+        distribution: BlobDistributionArg,
+        #[arg(long)]
+        trace_file: Option<String>,
+        #[arg(long, value_enum, default_value = "opened")]
+        open_mode: BlobOpenModeArg,
         #[arg(long, value_enum, default_value = "default")]
         parquet_writer_profile: ParquetWriterProfileArg,
         #[arg(long)]
@@ -638,6 +749,43 @@ async fn main() -> Result<()> {
                 iters,
                 open_mode,
                 parquet_read_mode,
+                parquet_writer_profile,
+                result_out,
+            )
+            .await
+        }
+        Command::BlobBatch {
+            engine,
+            dataset,
+            path,
+            column,
+            requests,
+            batch_size,
+            request_concurrency,
+            selector,
+            ordering,
+            api,
+            distribution,
+            trace_file,
+            open_mode,
+            parquet_writer_profile,
+            result_out,
+        } => {
+            run_blob_batch(
+                cli.seed,
+                engine,
+                dataset,
+                path,
+                column,
+                requests,
+                batch_size,
+                request_concurrency,
+                selector,
+                ordering,
+                api,
+                distribution,
+                trace_file,
+                open_mode,
                 parquet_writer_profile,
                 result_out,
             )
@@ -2236,10 +2384,13 @@ async fn run_ingest(
                     .to_string(),
             );
             params.insert(
-                "parquet_blob_dictionary_enabled".to_string(),
+                "parquet_encoding".to_string(),
+                "writer-defaults".to_string(),
+            );
+            params.insert(
+                "parquet_column_encoding_overrides".to_string(),
                 "false".to_string(),
             );
-            params.insert("parquet_blob_statistics".to_string(), "none".to_string());
         }
         let parquet = engine_parquet::ParquetEngine::new();
         let parquet_file = parquet
@@ -2811,6 +2962,502 @@ async fn run_blob(
     };
     write_result(&result, result_out).await?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_blob_batch(
+    seed: u64,
+    engine: EngineArg,
+    dataset: DatasetArg,
+    path: String,
+    column: String,
+    requests: usize,
+    batch_size: usize,
+    request_concurrency: usize,
+    selector: BlobSelectorArg,
+    ordering: BlobOrderingArg,
+    api: BlobBatchApiArg,
+    distribution: BlobDistributionArg,
+    trace_file: Option<String>,
+    open_mode: BlobOpenModeArg,
+    parquet_writer_profile: ParquetWriterProfileArg,
+    result_out: Option<String>,
+) -> Result<()> {
+    if requests == 0 {
+        anyhow::bail!("--requests must be greater than zero");
+    }
+    if batch_size == 0 {
+        anyhow::bail!("--batch-size must be greater than zero");
+    }
+    if request_concurrency == 0 {
+        anyhow::bail!("--request-concurrency must be greater than zero");
+    }
+
+    let lance_api = match (&engine, api) {
+        (EngineArg::Lance, BlobBatchApiArg::SingletonTake) => {
+            Some(engine_lance::BlobReadApi::SingletonTake)
+        }
+        (EngineArg::Lance, BlobBatchApiArg::BatchedTake) => {
+            Some(engine_lance::BlobReadApi::BatchedTake)
+        }
+        (EngineArg::Lance, BlobBatchApiArg::PlannedReadBlobs) => {
+            Some(engine_lance::BlobReadApi::PlannedRead)
+        }
+        (EngineArg::Lance, BlobBatchApiArg::ParquetRowSelection) => {
+            anyhow::bail!("Lance does not support --api parquet-row-selection")
+        }
+        (EngineArg::Parquet, BlobBatchApiArg::ParquetRowSelection) => None,
+        (EngineArg::Parquet, _) => {
+            anyhow::bail!("Parquet blob batches require --api parquet-row-selection")
+        }
+        (EngineArg::LanceFragment, _) => {
+            anyhow::bail!("engine lance-fragment supports scan workloads only")
+        }
+    };
+    if matches!(engine, EngineArg::Parquet) && selector != BlobSelectorArg::Indices {
+        anyhow::bail!("Parquet RowSelection accepts logical row indices, not Lance row addresses");
+    }
+    if matches!(
+        lance_api,
+        Some(engine_lance::BlobReadApi::SingletonTake | engine_lance::BlobReadApi::BatchedTake)
+    ) && ordering != BlobOrderingArg::Preserve
+    {
+        anyhow::bail!("take APIs do not expose unordered result delivery");
+    }
+    match (distribution, trace_file.as_deref()) {
+        (BlobDistributionArg::Uniform, Some(_)) => {
+            anyhow::bail!("--trace-file is only valid with --distribution ann-top-k")
+        }
+        (BlobDistributionArg::AnnTopK, None) => {
+            anyhow::bail!("--distribution ann-top-k requires --trace-file")
+        }
+        _ => {}
+    }
+
+    let started_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let parquet_read_mode = engine_parquet::ParquetReadMode::RowSelection;
+    let expected_parquet_profile =
+        engine_parquet::ParquetWriterProfile::from(parquet_writer_profile);
+
+    let lance_dataset = if matches!(engine, EngineArg::Lance) {
+        Some(
+            engine_lance::LanceEngine::new()
+                .open_dataset(std::path::Path::new(&path))
+                .await
+                .context("open Lance dataset before blob batch benchmark")?,
+        )
+    } else {
+        None
+    };
+    let parquet_file = if matches!(engine, EngineArg::Parquet) {
+        let file = engine_parquet::ParquetEngine::new()
+            .open_file_with_mode(std::path::Path::new(&path), parquet_read_mode)
+            .await
+            .context("open Parquet file before blob batch benchmark")?;
+        if file.writer_profile() != expected_parquet_profile {
+            anyhow::bail!(
+                "parquet writer profile mismatch: expected={} file={}",
+                expected_parquet_profile.as_str(),
+                file.writer_profile().as_str()
+            );
+        }
+        Some(Arc::new(file))
+    } else {
+        None
+    };
+
+    let row_count = match &engine {
+        EngineArg::Lance => {
+            lance_dataset
+                .as_ref()
+                .expect("Lance dataset is opened")
+                .count_rows(None)
+                .await? as u64
+        }
+        EngineArg::Parquet => parquet_file
+            .as_ref()
+            .expect("Parquet file is opened")
+            .row_count(),
+        EngineArg::LanceFragment => unreachable!(),
+    };
+    if row_count == 0 {
+        anyhow::bail!("cannot benchmark blobs in an empty dataset");
+    }
+    if batch_size as u64 > row_count {
+        anyhow::bail!("batch size {batch_size} exceeds dataset row count {row_count}");
+    }
+
+    let logical_trace = build_blob_trace(
+        seed,
+        row_count,
+        requests,
+        batch_size,
+        distribution,
+        trace_file.as_deref(),
+    )
+    .await?;
+    let trace_fingerprint = blob_trace_fingerprint(&logical_trace);
+    let effective_trace = if selector == BlobSelectorArg::Addresses {
+        let flattened: Vec<u64> = logical_trace.iter().flatten().copied().collect();
+        let addresses = engine_lance::LanceEngine::new()
+            .row_indices_to_addresses_opened(
+                lance_dataset
+                    .as_ref()
+                    .expect("address selector is only valid for Lance"),
+                &flattened,
+            )
+            .await
+            .context("map logical row trace to Lance row addresses before timing")?;
+        let mut cursor = 0usize;
+        logical_trace
+            .iter()
+            .map(|batch| {
+                let end = cursor + batch.len();
+                let mapped = addresses[cursor..end].to_vec();
+                cursor = end;
+                mapped
+            })
+            .collect::<Vec<_>>()
+    } else {
+        logical_trace.clone()
+    };
+
+    let preserve_order = ordering.preserve_order();
+    let in_flight = request_concurrency.min(requests);
+    let mut histogram = Histogram::<u64>::new(3)?;
+    let mut selected_blobs = 0u64;
+    let mut materialized_blobs = 0u64;
+    let mut total_bytes = 0u64;
+    let path_ref = path.as_str();
+    let column_ref = column.as_str();
+    let timer = WallTimer::start();
+
+    match &engine {
+        EngineArg::Lance => {
+            let opened = lance_dataset.as_ref().expect("Lance dataset is opened");
+            let lance_api = lance_api.expect("Lance API was validated");
+            let mut pending = stream::iter(effective_trace.iter())
+                .map(|rows| async move {
+                    let start = std::time::Instant::now();
+                    let read = match open_mode {
+                        BlobOpenModeArg::Opened => {
+                            engine_lance::LanceEngine::new()
+                                .read_blob_batch_opened(
+                                    opened,
+                                    rows,
+                                    column_ref,
+                                    selector.into(),
+                                    lance_api,
+                                    preserve_order,
+                                )
+                                .await?
+                        }
+                        BlobOpenModeArg::Reopen => {
+                            let reopened = engine_lance::LanceEngine::new()
+                                .open_dataset(std::path::Path::new(path_ref))
+                                .await?;
+                            engine_lance::LanceEngine::new()
+                                .read_blob_batch_opened(
+                                    &reopened,
+                                    rows,
+                                    column_ref,
+                                    selector.into(),
+                                    lance_api,
+                                    preserve_order,
+                                )
+                                .await?
+                        }
+                    };
+                    let latency_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    Ok::<_, anyhow::Error>((latency_us, read))
+                })
+                .buffer_unordered(in_flight);
+            while let Some(read) = pending.next().await {
+                let (latency_us, read) = read?;
+                histogram.record(latency_us)?;
+                selected_blobs = selected_blobs.saturating_add(read.selected_blobs as u64);
+                materialized_blobs =
+                    materialized_blobs.saturating_add(read.materialized_blobs as u64);
+                total_bytes = total_bytes.saturating_add(read.total_bytes as u64);
+            }
+        }
+        EngineArg::Parquet => {
+            let opened = parquet_file.as_ref().expect("Parquet file is opened");
+            let mut pending = stream::iter(logical_trace.iter())
+                .map(|rows| async move {
+                    let start = std::time::Instant::now();
+                    let read = match open_mode {
+                        BlobOpenModeArg::Opened => {
+                            engine_parquet::ParquetEngine::new()
+                                .read_binary_batch_opened(opened, rows, column_ref, preserve_order)
+                                .await?
+                        }
+                        BlobOpenModeArg::Reopen => {
+                            let reopened = engine_parquet::ParquetEngine::new()
+                                .open_file_with_mode(
+                                    std::path::Path::new(path_ref),
+                                    engine_parquet::ParquetReadMode::RowSelection,
+                                )
+                                .await?;
+                            engine_parquet::ParquetEngine::new()
+                                .read_binary_batch_opened(
+                                    &reopened,
+                                    rows,
+                                    column_ref,
+                                    preserve_order,
+                                )
+                                .await?
+                        }
+                    };
+                    let latency_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                    Ok::<_, anyhow::Error>((latency_us, read))
+                })
+                .buffer_unordered(in_flight);
+            while let Some(read) = pending.next().await {
+                let (latency_us, read) = read?;
+                histogram.record(latency_us)?;
+                selected_blobs = selected_blobs.saturating_add(read.selected_blobs as u64);
+                materialized_blobs =
+                    materialized_blobs.saturating_add(read.materialized_blobs as u64);
+                total_bytes = total_bytes.saturating_add(read.total_bytes as u64);
+            }
+        }
+        EngineArg::LanceFragment => unreachable!(),
+    }
+    let timing = timer.stop();
+    let expected_selected = u64::try_from(requests.saturating_mul(batch_size))?;
+    if selected_blobs != expected_selected {
+        anyhow::bail!(
+            "selected blob count mismatch: expected={expected_selected} actual={selected_blobs}"
+        );
+    }
+
+    let engine_name: EngineName = engine.clone().into();
+    let dataset_name: DatasetName = dataset.into();
+    let lance_file_version = lance_dataset
+        .as_ref()
+        .map(|dataset| {
+            dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()
+                .map(|version| version.to_string())
+        })
+        .transpose()?;
+    let mut params = BTreeMap::new();
+    let path_for_index = path.clone();
+    params.insert("path".to_string(), path);
+    maybe_add_lance_index_params(engine_name, &path_for_index, &mut params);
+    params.insert("column".to_string(), column);
+    params.insert("row_count".to_string(), row_count.to_string());
+    params.insert("requests".to_string(), requests.to_string());
+    params.insert("batch_size".to_string(), batch_size.to_string());
+    params.insert(
+        "request_concurrency".to_string(),
+        request_concurrency.to_string(),
+    );
+    params.insert("max_in_flight".to_string(), in_flight.to_string());
+    params.insert("selector".to_string(), selector.as_str().to_string());
+    params.insert("ordering".to_string(), ordering.as_str().to_string());
+    params.insert("api".to_string(), api.as_str().to_string());
+    params.insert(
+        "implementation".to_string(),
+        match engine_name {
+            EngineName::Lance => "lance-v2.2".to_string(),
+            EngineName::Parquet => match parquet_writer_profile {
+                ParquetWriterProfileArg::Default => "parquet-default".to_string(),
+                ParquetWriterProfileArg::RandomBlob => {
+                    "parquet-default-encoding-layout".to_string()
+                }
+            },
+            _ => unreachable!(),
+        },
+    );
+    params.insert(
+        "distribution".to_string(),
+        distribution.as_str().to_string(),
+    );
+    params.insert("open_mode".to_string(), open_mode.as_str().to_string());
+    params.insert("trace_fingerprint".to_string(), trace_fingerprint);
+    params.insert("selected_blobs".to_string(), selected_blobs.to_string());
+    params.insert(
+        "materialized_blobs".to_string(),
+        materialized_blobs.to_string(),
+    );
+    params.insert(
+        "us_per_blob".to_string(),
+        format!("{:.3}", timing.wall_time_us as f64 / selected_blobs as f64),
+    );
+    params.insert(
+        "content_consumption".to_string(),
+        "full-payload-length".to_string(),
+    );
+    if let Some(trace_file) = trace_file {
+        params.insert("trace_file".to_string(), trace_file);
+    }
+    if let Some(version) = lance_file_version {
+        params.insert("lance_file_version".to_string(), version);
+    }
+    if engine_name == EngineName::Parquet {
+        params.insert("parquet_read_mode".to_string(), "row-selection".to_string());
+        params.insert(
+            "parquet_writer_profile".to_string(),
+            parquet_writer_profile.as_str().to_string(),
+        );
+        params.insert(
+            "parquet_encoding".to_string(),
+            "writer-defaults".to_string(),
+        );
+        params.insert(
+            "parquet_offset_index_loaded".to_string(),
+            parquet_file
+                .as_ref()
+                .expect("Parquet file is opened")
+                .has_offset_index()
+                .to_string(),
+        );
+    }
+
+    let notes = vec![
+        "Latency is measured per complete business batch; dataset/file setup and trace preparation are outside the timed region.".to_string(),
+        match engine_name {
+            EngineName::Lance => {
+                "Each planned-read-blobs request calls read_blobs(...).execute() exactly once; take variants materialize every returned BlobFile.".to_string()
+            }
+            EngineName::Parquet => {
+                "Each request builds one Parquet reader with one RowSelection covering the complete batch.".to_string()
+            }
+            _ => unreachable!(),
+        },
+    ];
+    let result = RunResult {
+        meta: make_meta(
+            engine_name,
+            dataset_name,
+            Workload::RandomBlob,
+            seed,
+            started_at_unix_ms,
+            params,
+        ),
+        timing,
+        rows: Some(selected_blobs),
+        bytes: Some(total_bytes),
+        latency: Some(LatencySummary::from_histogram(&histogram)),
+        notes,
+    };
+    write_result(&result, result_out).await?;
+    Ok(())
+}
+
+async fn build_blob_trace(
+    seed: u64,
+    row_count: u64,
+    requests: usize,
+    batch_size: usize,
+    distribution: BlobDistributionArg,
+    trace_file: Option<&str>,
+) -> Result<Vec<Vec<u64>>> {
+    let mut trace = match distribution {
+        BlobDistributionArg::Uniform => {
+            let population = usize::try_from(row_count).context("row count does not fit usize")?;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut trace = Vec::with_capacity(requests);
+            for _ in 0..requests {
+                let mut batch = rand::seq::index::sample(&mut rng, population, batch_size)
+                    .into_vec()
+                    .into_iter()
+                    .map(|row| row as u64)
+                    .collect::<Vec<_>>();
+                batch.shuffle(&mut rng);
+                trace.push(batch);
+            }
+            trace
+        }
+        BlobDistributionArg::AnnTopK => {
+            let path = trace_file.expect("ANN trace file was validated");
+            let raw = tokio::fs::read_to_string(path)
+                .await
+                .with_context(|| format!("read ANN top-k trace {path}"))?;
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("parse ANN top-k trace {path}"))?;
+            let request_values = value
+                .get("requests")
+                .unwrap_or(&value)
+                .as_array()
+                .context("ANN top-k trace must be an array or contain a requests array")?;
+            if request_values.len() < requests {
+                anyhow::bail!(
+                    "ANN top-k trace has {} requests but benchmark needs {requests}",
+                    request_values.len()
+                );
+            }
+            let mut trace = Vec::with_capacity(requests);
+            for (request_index, request) in request_values.iter().take(requests).enumerate() {
+                let rows = request
+                    .get("indices")
+                    .or_else(|| request.get("row_indices"))
+                    .unwrap_or(request)
+                    .as_array()
+                    .with_context(|| {
+                        format!("ANN trace request {request_index} must contain an indices array")
+                    })?;
+                if rows.len() < batch_size {
+                    anyhow::bail!(
+                        "ANN trace request {request_index} has {} rows but batch size is {batch_size}",
+                        rows.len()
+                    );
+                }
+                let batch = rows
+                    .iter()
+                    .take(batch_size)
+                    .enumerate()
+                    .map(|(rank, row)| {
+                        row.as_u64().with_context(|| {
+                            format!(
+                                "ANN trace request {request_index} rank {rank} is not a u64 row index"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                trace.push(batch);
+            }
+            trace
+        }
+    };
+
+    for (request_index, batch) in trace.iter_mut().enumerate() {
+        if batch.len() != batch_size {
+            anyhow::bail!(
+                "trace request {request_index} has {} rows, expected {batch_size}",
+                batch.len()
+            );
+        }
+        let mut unique = HashSet::with_capacity(batch.len());
+        for &row in batch.iter() {
+            if row >= row_count {
+                anyhow::bail!(
+                    "trace request {request_index} contains row {row} outside row count {row_count}"
+                );
+            }
+            if !unique.insert(row) {
+                anyhow::bail!(
+                    "trace request {request_index} contains duplicate row {row}; one RowSelection cannot represent duplicates"
+                );
+            }
+        }
+    }
+    Ok(trace)
+}
+
+fn blob_trace_fingerprint(trace: &[Vec<u64>]) -> String {
+    let mut digest = 0xcbf29ce484222325u64;
+    for batch in trace {
+        digest = fnv1a64_update(digest, &(batch.len() as u64).to_le_bytes());
+        for row in batch {
+            digest = fnv1a64_update(digest, &row.to_le_bytes());
+        }
+    }
+    format!("{digest:016x}")
 }
 
 async fn run_verify_blob(

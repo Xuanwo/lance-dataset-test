@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,6 +11,8 @@ pub use lance::dataset::ProjectionRequest;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
 pub use lance::Dataset;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::deletion::OffsetMapper;
 use lance_datafusion::exec::{new_session_context, LanceExecutionOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::ScalarIndexParams;
@@ -24,6 +27,26 @@ pub const ENGINE_ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const LANCE_DEP_VERSION: &str = "09174bc";
 
 pub struct LanceEngine;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobSelector {
+    Indices,
+    Addresses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobReadApi {
+    SingletonTake,
+    BatchedTake,
+    PlannedRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobBatchRead {
+    pub selected_blobs: usize,
+    pub materialized_blobs: usize,
+    pub total_bytes: usize,
+}
 
 mod binary_compression_none_input;
 mod blob_input;
@@ -615,6 +638,134 @@ impl LanceEngine {
             return Ok(None);
         };
         Ok(Some(blob.read().await?.to_vec()))
+    }
+
+    pub async fn read_blob_batch_opened(
+        &self,
+        dataset: &Arc<Dataset>,
+        rows: &[u64],
+        column: &str,
+        selector: BlobSelector,
+        api: BlobReadApi,
+        preserve_order: bool,
+    ) -> Result<BlobBatchRead> {
+        let selected_blobs = rows.len();
+        let payloads = match api {
+            BlobReadApi::SingletonTake => {
+                let mut payloads = Vec::with_capacity(rows.len());
+                for &row in rows {
+                    let blobs = match selector {
+                        BlobSelector::Indices => {
+                            dataset.take_blobs_by_indices(&[row], column).await?
+                        }
+                        BlobSelector::Addresses => {
+                            dataset.take_blobs_by_addresses(&[row], column).await?
+                        }
+                    };
+                    for blob in blobs {
+                        payloads.push(blob.read().await?);
+                    }
+                }
+                payloads
+            }
+            BlobReadApi::BatchedTake => {
+                let blobs = match selector {
+                    BlobSelector::Indices => dataset.take_blobs_by_indices(rows, column).await?,
+                    BlobSelector::Addresses => {
+                        dataset.take_blobs_by_addresses(rows, column).await?
+                    }
+                };
+                futures::future::try_join_all(blobs.iter().map(|blob| blob.read())).await?
+            }
+            BlobReadApi::PlannedRead => {
+                let builder = dataset.read_blobs(column)?.preserve_order(preserve_order);
+                let builder = match selector {
+                    BlobSelector::Indices => builder.with_row_indices(rows.to_vec()),
+                    BlobSelector::Addresses => builder.with_row_addresses(rows.to_vec()),
+                };
+                builder
+                    .execute()
+                    .await?
+                    .into_iter()
+                    .map(|blob| blob.data)
+                    .collect()
+            }
+        };
+        let total_bytes = payloads.iter().map(|payload| payload.len()).sum();
+        Ok(BlobBatchRead {
+            selected_blobs,
+            materialized_blobs: payloads.len(),
+            total_bytes,
+        })
+    }
+
+    pub async fn row_indices_to_addresses_opened(
+        &self,
+        dataset: &Arc<Dataset>,
+        row_indices: &[u64],
+    ) -> Result<Vec<u64>> {
+        if row_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut unique_indices = row_indices.to_vec();
+        unique_indices.sort_unstable();
+        unique_indices.dedup();
+
+        let fragments = dataset.get_fragments();
+        let mut fragment_iter = fragments.iter();
+        let mut current_fragment = fragment_iter.next();
+        let mut current_rows = match current_fragment {
+            Some(fragment) => fragment.count_rows(None).await? as u64,
+            None => 0,
+        };
+        let mut current_mapper = match current_fragment {
+            Some(fragment) => fragment.get_deletion_vector().await?.map(OffsetMapper::new),
+            None => None,
+        };
+        let mut fragment_start = 0u64;
+        let mut addresses = HashMap::with_capacity(unique_indices.len());
+
+        for row_index in unique_indices {
+            while current_fragment.is_some()
+                && row_index >= fragment_start.saturating_add(current_rows)
+            {
+                fragment_start = fragment_start.saturating_add(current_rows);
+                current_fragment = fragment_iter.next();
+                current_rows = match current_fragment {
+                    Some(fragment) => fragment.count_rows(None).await? as u64,
+                    None => 0,
+                };
+                current_mapper = match current_fragment {
+                    Some(fragment) => fragment.get_deletion_vector().await?.map(OffsetMapper::new),
+                    None => None,
+                };
+            }
+
+            let Some(fragment) = current_fragment else {
+                anyhow::bail!("row index {row_index} is outside the dataset");
+            };
+            let logical_offset = u32::try_from(row_index - fragment_start)?;
+            let physical_offset = current_mapper
+                .as_mut()
+                .map(|mapper| mapper.map_offset(logical_offset))
+                .unwrap_or(logical_offset);
+            let fragment_id = u32::try_from(fragment.id())?;
+            addresses.insert(
+                row_index,
+                u64::from(RowAddress::new_from_parts(fragment_id, physical_offset)),
+            );
+        }
+
+        row_indices
+            .iter()
+            .map(|row_index| {
+                addresses
+                    .get(row_index)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("missing row address for index {row_index}"))
+            })
+            .collect()
     }
 
     pub async fn evolution_add_column_sql(
