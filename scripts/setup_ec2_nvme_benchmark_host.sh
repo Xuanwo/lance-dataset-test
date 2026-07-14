@@ -16,6 +16,7 @@ sudo dnf install -y \
   openssl-devel \
   perl \
   pkgconf-pkg-config \
+  protobuf-compiler \
   python3 \
   python3-pip \
   xfsprogs
