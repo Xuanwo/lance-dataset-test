@@ -464,6 +464,17 @@ def write_report(
                 f"| {dataset} | {distribution} | {selected} | {materialized:.0f} | {materialized / selected:.1%} |"
             )
 
+    lines.extend(
+        [
+            "",
+            "## ANN trace provenance",
+            "",
+            "- OpenVid uses 128 precomputed exact L2 top-64 result lists from the SIFT1M ground truth over one million base vectors.",
+            "- LAION uses 128 exact L2 top-64 result lists recomputed with `faiss.IndexFlatL2` over the first 200,000 SIFT1M base vectors.",
+            "- These are data-dependent nearest-neighbor result traces, preserving ranked top-k access locality. Their row IDs are mapped onto the blob datasets; they are not searches over OpenVid or LAION embeddings.",
+        ]
+    )
+
     for dataset in ["open_vid", "laion10m"]:
         for distribution in ["uniform", "ann-top-k"]:
             lines.extend(
