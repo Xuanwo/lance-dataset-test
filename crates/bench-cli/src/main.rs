@@ -125,6 +125,51 @@ impl BlobOpenModeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ParquetReadModeArg {
+    Sequential,
+    RowSelection,
+}
+
+impl ParquetReadModeArg {
+    fn as_str(self) -> &'static str {
+        engine_parquet::ParquetReadMode::from(self).as_str()
+    }
+}
+
+impl From<ParquetReadModeArg> for engine_parquet::ParquetReadMode {
+    fn from(value: ParquetReadModeArg) -> Self {
+        match value {
+            ParquetReadModeArg::Sequential => Self::Sequential,
+            ParquetReadModeArg::RowSelection => Self::RowSelection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ParquetWriterProfileArg {
+    Default,
+    RandomBlob,
+}
+
+impl ParquetWriterProfileArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::RandomBlob => "random-blob",
+        }
+    }
+}
+
+impl From<ParquetWriterProfileArg> for engine_parquet::ParquetWriterProfile {
+    fn from(value: ParquetWriterProfileArg) -> Self {
+        match value {
+            ParquetWriterProfileArg::Default => Self::Default,
+            ParquetWriterProfileArg::RandomBlob => Self::RandomBlob,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "bench")]
 struct Cli {
@@ -206,6 +251,14 @@ enum Command {
         lance_max_rows_per_file: Option<usize>,
         #[arg(long)]
         lance_max_bytes_per_file: Option<usize>,
+        #[arg(long, value_enum, default_value = "default")]
+        parquet_writer_profile: ParquetWriterProfileArg,
+        #[arg(long)]
+        parquet_data_page_size_limit: Option<usize>,
+        #[arg(long)]
+        parquet_write_batch_size: Option<usize>,
+        #[arg(long)]
+        parquet_max_row_group_bytes: Option<usize>,
         #[arg(long, default_value_t = 0)]
         row_id_offset: u64,
         #[arg(long)]
@@ -300,6 +353,27 @@ enum Command {
         iters: u64,
         #[arg(long, value_enum, default_value = "opened")]
         open_mode: BlobOpenModeArg,
+        #[arg(long, value_enum, default_value = "sequential")]
+        parquet_read_mode: ParquetReadModeArg,
+        #[arg(long, value_enum, default_value = "default")]
+        parquet_writer_profile: ParquetWriterProfileArg,
+        #[arg(long)]
+        result_out: Option<String>,
+    },
+    #[command(name = "verify-blob")]
+    VerifyBlob {
+        #[arg(long)]
+        dataset: DatasetArg,
+        #[arg(long)]
+        lance_path: String,
+        #[arg(long)]
+        parquet_path: String,
+        #[arg(long)]
+        column: String,
+        #[arg(long, default_value_t = 32)]
+        samples: u64,
+        #[arg(long, value_enum, default_value = "row-selection")]
+        parquet_read_mode: ParquetReadModeArg,
         #[arg(long)]
         result_out: Option<String>,
     },
@@ -448,6 +522,10 @@ async fn main() -> Result<()> {
             lance_write_mode,
             lance_max_rows_per_file,
             lance_max_bytes_per_file,
+            parquet_writer_profile,
+            parquet_data_page_size_limit,
+            parquet_write_batch_size,
+            parquet_max_row_group_bytes,
             row_id_offset,
             result_out,
         } => {
@@ -464,6 +542,10 @@ async fn main() -> Result<()> {
                 lance_write_mode,
                 lance_max_rows_per_file,
                 lance_max_bytes_per_file,
+                parquet_writer_profile,
+                parquet_data_page_size_limit,
+                parquet_write_batch_size,
+                parquet_max_row_group_bytes,
                 row_id_offset,
                 result_out,
             )
@@ -543,10 +625,42 @@ async fn main() -> Result<()> {
             column,
             iters,
             open_mode,
+            parquet_read_mode,
+            parquet_writer_profile,
             result_out,
         } => {
             run_blob(
-                cli.seed, engine, dataset, path, column, iters, open_mode, result_out,
+                cli.seed,
+                engine,
+                dataset,
+                path,
+                column,
+                iters,
+                open_mode,
+                parquet_read_mode,
+                parquet_writer_profile,
+                result_out,
+            )
+            .await
+        }
+        Command::VerifyBlob {
+            dataset,
+            lance_path,
+            parquet_path,
+            column,
+            samples,
+            parquet_read_mode,
+            result_out,
+        } => {
+            run_verify_blob(
+                cli.seed,
+                dataset,
+                lance_path,
+                parquet_path,
+                column,
+                samples,
+                parquet_read_mode,
+                result_out,
             )
             .await
         }
@@ -722,6 +836,10 @@ async fn run_ingest_lance_versions(
             None,
             None,
             None,
+            ParquetWriterProfileArg::Default,
+            None,
+            None,
+            None,
             0,
             Some(result_out),
         )
@@ -745,6 +863,10 @@ async fn run_ingest_lance_versions(
                 limit_rows,
                 Some(version),
                 Some(index_columns.clone()),
+                None,
+                None,
+                None,
+                ParquetWriterProfileArg::Default,
                 None,
                 None,
                 None,
@@ -954,6 +1076,10 @@ async fn run_suite(
                         None,
                         None,
                         None,
+                        ParquetWriterProfileArg::Default,
+                        None,
+                        None,
+                        None,
                         0,
                         Some(result_out),
                     )
@@ -1006,6 +1132,10 @@ async fn run_suite(
                             limit_rows,
                             Some(version),
                             None,
+                            None,
+                            None,
+                            None,
+                            ParquetWriterProfileArg::Default,
                             None,
                             None,
                             None,
@@ -1232,6 +1362,8 @@ async fn run_suite(
                                 col,
                                 blob_iters,
                                 BlobOpenModeArg::Opened,
+                                ParquetReadModeArg::Sequential,
+                                ParquetWriterProfileArg::Default,
                                 Some(result_out),
                             )
                             .await
@@ -1440,6 +1572,8 @@ async fn run_suite(
                                 col,
                                 blob_iters,
                                 BlobOpenModeArg::Opened,
+                                ParquetReadModeArg::Sequential,
+                                ParquetWriterProfileArg::Default,
                                 Some(result_out),
                             )
                             .await
@@ -1863,6 +1997,8 @@ async fn run_dispatch(
                 column,
                 iters,
                 BlobOpenModeArg::Opened,
+                ParquetReadModeArg::Sequential,
+                ParquetWriterProfileArg::Default,
                 Some(out),
             )
             .await
@@ -1925,6 +2061,10 @@ async fn run_ingest(
     lance_write_mode: Option<LanceWriteModeArg>,
     lance_max_rows_per_file: Option<usize>,
     lance_max_bytes_per_file: Option<usize>,
+    parquet_writer_profile: ParquetWriterProfileArg,
+    parquet_data_page_size_limit: Option<usize>,
+    parquet_write_batch_size: Option<usize>,
+    parquet_max_row_group_bytes: Option<usize>,
     row_id_offset: u64,
     result_out: Option<String>,
 ) -> Result<()> {
@@ -1948,6 +2088,33 @@ async fn run_ingest(
     let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
         CountingRecordBatchReader::new(opened.reader, counters.clone()),
     );
+
+    let parquet_writer_options = match parquet_writer_profile {
+        ParquetWriterProfileArg::Default => {
+            if parquet_data_page_size_limit.is_some()
+                || parquet_write_batch_size.is_some()
+                || parquet_max_row_group_bytes.is_some()
+            {
+                anyhow::bail!(
+                    "parquet writer overrides require --parquet-writer-profile random-blob"
+                );
+            }
+            engine_parquet::ParquetWriterOptions::default()
+        }
+        ParquetWriterProfileArg::RandomBlob => {
+            let columns = blob_columns(dataset)
+                .iter()
+                .map(|column| (*column).to_string())
+                .collect();
+            let mut options = engine_parquet::ParquetWriterOptions::random_blob(columns);
+            options.data_page_size_limit =
+                parquet_data_page_size_limit.or(options.data_page_size_limit);
+            options.write_batch_size = parquet_write_batch_size.or(options.write_batch_size);
+            options.max_row_group_bytes =
+                parquet_max_row_group_bytes.or(options.max_row_group_bytes);
+            options
+        }
+    };
 
     match engine {
         EngineArg::Lance => {
@@ -1986,7 +2153,11 @@ async fn run_ingest(
         }
         EngineArg::Parquet => {
             engine_parquet::ParquetEngine::new()
-                .ingest(reader, std::path::Path::new(&out))
+                .ingest(
+                    reader,
+                    std::path::Path::new(&out),
+                    parquet_writer_options.clone(),
+                )
                 .await?
         }
     }
@@ -2033,6 +2204,62 @@ async fn run_ingest(
         if let Some(v) = lance_max_bytes_per_file {
             params.insert("lance_max_bytes_per_file".to_string(), v.to_string());
         }
+    } else if engine_name == EngineName::Parquet {
+        params.insert(
+            "parquet_writer_profile".to_string(),
+            parquet_writer_options.profile.as_str().to_string(),
+        );
+        if parquet_writer_options.profile == engine_parquet::ParquetWriterProfile::RandomBlob {
+            params.insert(
+                "parquet_blob_columns".to_string(),
+                parquet_writer_options.blob_columns.join(","),
+            );
+            params.insert(
+                "parquet_data_page_size_limit".to_string(),
+                parquet_writer_options
+                    .data_page_size_limit
+                    .expect("random-blob profile has a data page size limit")
+                    .to_string(),
+            );
+            params.insert(
+                "parquet_write_batch_size".to_string(),
+                parquet_writer_options
+                    .write_batch_size
+                    .expect("random-blob profile has a write batch size")
+                    .to_string(),
+            );
+            params.insert(
+                "parquet_max_row_group_bytes".to_string(),
+                parquet_writer_options
+                    .max_row_group_bytes
+                    .expect("random-blob profile has a row group byte limit")
+                    .to_string(),
+            );
+            params.insert(
+                "parquet_blob_dictionary_enabled".to_string(),
+                "false".to_string(),
+            );
+            params.insert("parquet_blob_statistics".to_string(), "none".to_string());
+        }
+        let parquet = engine_parquet::ParquetEngine::new();
+        let parquet_file = parquet
+            .open_file_with_mode(
+                std::path::Path::new(&dataset_out),
+                engine_parquet::ParquetReadMode::RowSelection,
+            )
+            .await?;
+        params.insert(
+            "parquet_row_group_count".to_string(),
+            parquet_file.row_group_count().to_string(),
+        );
+        params.insert(
+            "parquet_offset_index_loaded".to_string(),
+            parquet_file.has_offset_index().to_string(),
+        );
+        params.insert(
+            "parquet_file_bytes".to_string(),
+            std::fs::metadata(&dataset_out)?.len().to_string(),
+        );
     }
     params.insert(
         "schema_fields".to_string(),
@@ -2398,12 +2625,17 @@ async fn run_blob(
     column: String,
     iters: u64,
     open_mode: BlobOpenModeArg,
+    parquet_read_mode: ParquetReadModeArg,
+    parquet_writer_profile: ParquetWriterProfileArg,
     result_out: Option<String>,
 ) -> Result<()> {
     let started_at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let mut rng = StdRng::seed_from_u64(seed);
     let lance_engine = engine_lance::LanceEngine::new();
     let parquet_engine = engine_parquet::ParquetEngine::new();
+    let parquet_read_mode_impl = engine_parquet::ParquetReadMode::from(parquet_read_mode);
+    let parquet_writer_profile_impl =
+        engine_parquet::ParquetWriterProfile::from(parquet_writer_profile);
 
     let lance_dataset = if matches!(engine, EngineArg::Lance) {
         Some(
@@ -2418,13 +2650,22 @@ async fn run_blob(
     let parquet_file = if matches!(engine, EngineArg::Parquet) {
         Some(
             parquet_engine
-                .open_file(std::path::Path::new(&path))
+                .open_file_with_mode(std::path::Path::new(&path), parquet_read_mode_impl)
                 .await
                 .context("open parquet file")?,
         )
     } else {
         None
     };
+    if let Some(file) = &parquet_file {
+        if file.writer_profile() != parquet_writer_profile_impl {
+            anyhow::bail!(
+                "parquet writer profile mismatch: expected={} file={}",
+                parquet_writer_profile_impl.as_str(),
+                file.writer_profile().as_str()
+            );
+        }
+    }
     let row_count = match engine {
         EngineArg::Lance => {
             lance_dataset
@@ -2489,7 +2730,12 @@ async fn run_blob(
                 }
                 BlobOpenModeArg::Reopen => {
                     parquet_engine
-                        .take_binary_one(std::path::Path::new(&path), row_offset, &column)
+                        .take_binary_one_with_mode(
+                            std::path::Path::new(&path),
+                            row_offset,
+                            &column,
+                            parquet_read_mode_impl,
+                        )
                         .await? as u64
                 }
             },
@@ -2510,6 +2756,37 @@ async fn run_blob(
     params.insert("row_count".to_string(), row_count.to_string());
     params.insert("column".to_string(), column.clone());
     params.insert("open_mode".to_string(), open_mode.as_str().to_string());
+    let implementation = match engine_name {
+        EngineName::Lance => format!(
+            "lance-v{}",
+            lance_file_version.as_deref().unwrap_or("unknown")
+        ),
+        EngineName::Parquet => format!(
+            "parquet-{}-writer-{}-reader",
+            parquet_writer_profile.as_str(),
+            parquet_read_mode.as_str()
+        ),
+        EngineName::LanceFragment | EngineName::Unknown => "unknown".to_string(),
+    };
+    params.insert("implementation".to_string(), implementation);
+    if engine_name == EngineName::Parquet {
+        params.insert(
+            "parquet_read_mode".to_string(),
+            parquet_read_mode.as_str().to_string(),
+        );
+        params.insert(
+            "parquet_writer_profile".to_string(),
+            parquet_writer_profile.as_str().to_string(),
+        );
+        params.insert(
+            "parquet_offset_index_loaded".to_string(),
+            parquet_file
+                .as_ref()
+                .expect("parquet file must be opened")
+                .has_offset_index()
+                .to_string(),
+        );
+    }
     if let Some(v) = lance_file_version {
         params.insert("lance_file_version".to_string(), v);
     }
@@ -2534,6 +2811,125 @@ async fn run_blob(
     };
     write_result(&result, result_out).await?;
     Ok(())
+}
+
+async fn run_verify_blob(
+    seed: u64,
+    dataset: DatasetArg,
+    lance_path: String,
+    parquet_path: String,
+    column: String,
+    samples: u64,
+    parquet_read_mode: ParquetReadModeArg,
+    result_out: Option<String>,
+) -> Result<()> {
+    if samples == 0 {
+        anyhow::bail!("--samples must be greater than zero");
+    }
+    let sample_count = usize::try_from(samples).context("sample count does not fit usize")?;
+
+    let lance_engine = engine_lance::LanceEngine::new();
+    let lance_dataset = lance_engine
+        .open_dataset(std::path::Path::new(&lance_path))
+        .await
+        .context("open lance dataset for blob verification")?;
+    let lance_rows = lance_dataset.count_rows(None).await? as u64;
+
+    let parquet_engine = engine_parquet::ParquetEngine::new();
+    let read_mode = engine_parquet::ParquetReadMode::from(parquet_read_mode);
+    let parquet_file = parquet_engine
+        .open_file_with_mode(std::path::Path::new(&parquet_path), read_mode)
+        .await
+        .context("open parquet file for blob verification")?;
+    let parquet_rows = parquet_file.row_count();
+    if lance_rows != parquet_rows {
+        anyhow::bail!("row count mismatch: lance={lance_rows} parquet={parquet_rows}");
+    }
+    if lance_rows == 0 {
+        anyhow::bail!("cannot verify blobs in an empty dataset");
+    }
+
+    let mut offsets = Vec::with_capacity(sample_count);
+    for offset in [0, lance_rows / 2, lance_rows - 1] {
+        if offsets.len() >= sample_count {
+            break;
+        }
+        if !offsets.contains(&offset) {
+            offsets.push(offset);
+        }
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    while offsets.len() < sample_count {
+        offsets.push(rng.random_range(0..lance_rows));
+    }
+
+    let mut total_bytes = 0u64;
+    let mut digest = 0xcbf29ce484222325u64;
+    for &row_offset in &offsets {
+        let lance_value = lance_engine
+            .read_blob_one_opened(&lance_dataset, row_offset, &column)
+            .await?;
+        let parquet_value = parquet_engine
+            .read_binary_one_opened(&parquet_file, row_offset, &column)
+            .await?;
+        if lance_value != parquet_value {
+            anyhow::bail!(
+                "full blob content mismatch at row {row_offset}: lance_len={:?} parquet_len={:?}",
+                lance_value.as_ref().map(Vec::len),
+                parquet_value.as_ref().map(Vec::len)
+            );
+        }
+
+        digest = fnv1a64_update(digest, &row_offset.to_le_bytes());
+        match lance_value {
+            None => digest = fnv1a64_update(digest, &[0]),
+            Some(value) => {
+                digest = fnv1a64_update(digest, &[1]);
+                digest = fnv1a64_update(digest, &(value.len() as u64).to_le_bytes());
+                digest = fnv1a64_update(digest, &value);
+                total_bytes = total_bytes.saturating_add(value.len() as u64);
+            }
+        }
+    }
+
+    let lance_file_version = lance_dataset
+        .manifest
+        .data_storage_format
+        .lance_file_version()?
+        .to_string();
+    let result = serde_json::json!({
+        "dataset": DatasetName::from(dataset),
+        "seed": seed,
+        "samples": samples,
+        "rows_checked": offsets,
+        "row_count": lance_rows,
+        "column": column,
+        "lance_path": lance_path,
+        "lance_file_version": lance_file_version,
+        "parquet_path": parquet_path,
+        "parquet_read_mode": parquet_read_mode.as_str(),
+        "parquet_writer_profile": parquet_file.writer_profile().as_str(),
+        "parquet_offset_index_loaded": parquet_file.has_offset_index(),
+        "full_content_compared": true,
+        "matched": true,
+        "total_bytes": total_bytes,
+        "fnv1a64": format!("{digest:016x}"),
+    });
+    let json = serde_json::to_string_pretty(&result)?;
+    if let Some(path) = result_out {
+        tokio::fs::write(path, json).await?;
+    } else {
+        println!("{json}");
+    }
+    Ok(())
+}
+
+fn fnv1a64_update(mut digest: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    digest
 }
 
 async fn run_evolve(

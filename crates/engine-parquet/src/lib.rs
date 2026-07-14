@@ -12,11 +12,127 @@ use arrow_select::filter::filter_record_batch;
 use bench_core::metrics::{LatencySummary, Timing, WallTimer};
 use bench_core::query::Filter;
 use hdrhistogram::Histogram;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelectionPolicy,
+};
 use parquet::arrow::{ArrowWriter, ProjectionMask};
+use parquet::basic::Compression;
+use parquet::file::metadata::{KeyValue, PageIndexPolicy};
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 
 pub const ENGINE_ADAPTER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PARQUET_DEP_VERSION: &str = "58.3.0";
+pub const RANDOM_BLOB_DATA_PAGE_SIZE_LIMIT: usize = 64 * 1024;
+pub const RANDOM_BLOB_WRITE_BATCH_SIZE: usize = 1;
+pub const RANDOM_BLOB_MAX_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024;
+const WRITER_PROFILE_METADATA_KEY: &str = "lance-dataset-test.parquet-writer-profile";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParquetReadMode {
+    #[default]
+    Sequential,
+    RowSelection,
+}
+
+impl ParquetReadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequential => "sequential",
+            Self::RowSelection => "row-selection",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParquetWriterProfile {
+    #[default]
+    Default,
+    RandomBlob,
+}
+
+impl ParquetWriterProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::RandomBlob => "random-blob",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParquetWriterOptions {
+    pub profile: ParquetWriterProfile,
+    pub blob_columns: Vec<String>,
+    pub data_page_size_limit: Option<usize>,
+    pub write_batch_size: Option<usize>,
+    pub max_row_group_bytes: Option<usize>,
+}
+
+impl Default for ParquetWriterOptions {
+    fn default() -> Self {
+        Self {
+            profile: ParquetWriterProfile::Default,
+            blob_columns: Vec::new(),
+            data_page_size_limit: None,
+            write_batch_size: None,
+            max_row_group_bytes: None,
+        }
+    }
+}
+
+impl ParquetWriterOptions {
+    pub fn random_blob(blob_columns: Vec<String>) -> Self {
+        Self {
+            profile: ParquetWriterProfile::RandomBlob,
+            blob_columns,
+            data_page_size_limit: Some(RANDOM_BLOB_DATA_PAGE_SIZE_LIMIT),
+            write_batch_size: Some(RANDOM_BLOB_WRITE_BATCH_SIZE),
+            max_row_group_bytes: Some(RANDOM_BLOB_MAX_ROW_GROUP_BYTES),
+        }
+    }
+
+    fn writer_properties(&self) -> Result<Option<WriterProperties>> {
+        if self.profile == ParquetWriterProfile::Default {
+            return Ok(None);
+        }
+
+        let data_page_size_limit = self
+            .data_page_size_limit
+            .context("random-blob profile requires data_page_size_limit")?;
+        let write_batch_size = self
+            .write_batch_size
+            .context("random-blob profile requires write_batch_size")?;
+        let max_row_group_bytes = self
+            .max_row_group_bytes
+            .context("random-blob profile requires max_row_group_bytes")?;
+        if data_page_size_limit == 0 || write_batch_size == 0 || max_row_group_bytes == 0 {
+            anyhow::bail!("random-blob writer limits must be greater than zero");
+        }
+        if self.blob_columns.is_empty() {
+            anyhow::bail!("random-blob profile requires at least one blob column");
+        }
+
+        let mut builder = WriterProperties::builder()
+            .set_data_page_size_limit(data_page_size_limit)
+            .set_write_batch_size(write_batch_size)
+            .set_max_row_group_bytes(Some(max_row_group_bytes))
+            .set_offset_index_disabled(false)
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                WRITER_PROFILE_METADATA_KEY.to_string(),
+                self.profile.as_str().to_string(),
+            )]));
+        for column in &self.blob_columns {
+            let path = ColumnPath::from(column.as_str());
+            builder = builder
+                .set_column_dictionary_enabled(path.clone(), false)
+                .set_column_compression(path.clone(), Compression::UNCOMPRESSED)
+                .set_column_statistics_enabled(path, EnabledStatistics::None);
+        }
+        Ok(Some(builder.build()))
+    }
+}
 
 pub struct ParquetEngine;
 
@@ -25,6 +141,8 @@ pub struct OpenedParquetFile {
     metadata: ArrowReaderMetadata,
     row_group_start_rows: Vec<u64>,
     root_name_to_index: HashMap<String, usize>,
+    read_mode: ParquetReadMode,
+    writer_profile: ParquetWriterProfile,
 }
 
 impl ParquetEngine {
@@ -33,11 +151,43 @@ impl ParquetEngine {
     }
 
     pub async fn open_file(&self, path: &Path) -> Result<OpenedParquetFile> {
+        self.open_file_with_mode(path, ParquetReadMode::Sequential)
+            .await
+    }
+
+    pub async fn open_file_with_mode(
+        &self,
+        path: &Path,
+        read_mode: ParquetReadMode,
+    ) -> Result<OpenedParquetFile> {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<OpenedParquetFile> {
             let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-            let metadata = ArrowReaderMetadata::load(&file, Default::default())
+            let options = match read_mode {
+                ParquetReadMode::Sequential => ArrowReaderOptions::new(),
+                ParquetReadMode::RowSelection => {
+                    ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Required)
+                }
+            };
+            let metadata = ArrowReaderMetadata::load(&file, options)
                 .with_context(|| format!("load parquet metadata {}", path.display()))?;
+            let writer_profile = metadata
+                .metadata()
+                .file_metadata()
+                .key_value_metadata()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.key == WRITER_PROFILE_METADATA_KEY)
+                })
+                .and_then(|entry| entry.value.as_deref())
+                .map(|value| match value {
+                    "default" => Ok(ParquetWriterProfile::Default),
+                    "random-blob" => Ok(ParquetWriterProfile::RandomBlob),
+                    other => anyhow::bail!("unknown parquet writer profile in metadata: {other}"),
+                })
+                .transpose()?
+                .unwrap_or_default();
 
             let mut row_group_start_rows = Vec::with_capacity(metadata.metadata().num_row_groups());
             let mut start = 0u64;
@@ -56,6 +206,8 @@ impl ParquetEngine {
                 metadata,
                 row_group_start_rows,
                 root_name_to_index,
+                read_mode,
+                writer_profile,
             })
         })
         .await?
@@ -80,7 +232,9 @@ impl ParquetEngine {
         &self,
         reader: Box<dyn RecordBatchReader + Send>,
         out: &Path,
+        options: ParquetWriterOptions,
     ) -> Result<()> {
+        let properties = options.writer_properties()?;
         let out = out.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<()> {
             if let Some(parent) = out.parent() {
@@ -91,7 +245,7 @@ impl ParquetEngine {
             }
 
             let file = File::create(&out).with_context(|| format!("create {}", out.display()))?;
-            let mut writer = ArrowWriter::try_new(file, reader.schema(), None)
+            let mut writer = ArrowWriter::try_new(file, reader.schema(), properties)
                 .with_context(|| format!("create parquet writer {}", out.display()))?;
 
             for batch in reader {
@@ -263,7 +417,18 @@ impl ParquetEngine {
         row_offset: u64,
         column: &str,
     ) -> Result<usize> {
-        let opened = self.open_file(file_path).await?;
+        self.take_binary_one_with_mode(file_path, row_offset, column, ParquetReadMode::Sequential)
+            .await
+    }
+
+    pub async fn take_binary_one_with_mode(
+        &self,
+        file_path: &Path,
+        row_offset: u64,
+        column: &str,
+        read_mode: ParquetReadMode,
+    ) -> Result<usize> {
+        let opened = self.open_file_with_mode(file_path, read_mode).await?;
         self.take_binary_one_opened(&opened, row_offset, column)
             .await
     }
@@ -274,11 +439,45 @@ impl ParquetEngine {
         row_offset: u64,
         column: &str,
     ) -> Result<usize> {
+        match self
+            .read_binary_one_impl(opened, row_offset, column, false)
+            .await?
+        {
+            BinaryRead::Null => Ok(0),
+            BinaryRead::Length(len) => Ok(len),
+            BinaryRead::Value(value) => Ok(value.len()),
+        }
+    }
+
+    pub async fn read_binary_one_opened(
+        &self,
+        opened: &OpenedParquetFile,
+        row_offset: u64,
+        column: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        match self
+            .read_binary_one_impl(opened, row_offset, column, true)
+            .await?
+        {
+            BinaryRead::Null => Ok(None),
+            BinaryRead::Value(value) => Ok(Some(value)),
+            BinaryRead::Length(_) => unreachable!("materialized reads return a value"),
+        }
+    }
+
+    async fn read_binary_one_impl(
+        &self,
+        opened: &OpenedParquetFile,
+        row_offset: u64,
+        column: &str,
+        materialize: bool,
+    ) -> Result<BinaryRead> {
         let (rg_idx, in_rg_offset) =
             locate_row_group(&opened.row_group_start_rows, row_offset).unwrap_or((0, 0));
 
         let file = opened.file.try_clone().context("clone file")?;
         let metadata = opened.metadata.clone();
+        let read_mode = opened.read_mode;
 
         let Some(&root_idx) = opened.root_name_to_index.get(column) else {
             anyhow::bail!("column not found: {column}");
@@ -286,36 +485,73 @@ impl ParquetEngine {
         let projection_mask = ProjectionMask::roots(metadata.parquet_schema(), [root_idx]);
 
         let column = column.to_string();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
-            let mut reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
+        tokio::task::spawn_blocking(move || -> Result<BinaryRead> {
+            let row_group_rows = usize::try_from(metadata.metadata().row_group(rg_idx).num_rows())
+                .context("row group row count does not fit usize")?;
+            let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata)
                 .with_row_groups(vec![rg_idx])
-                .with_projection(projection_mask)
-                .with_batch_size(1024)
-                .build()?;
+                .with_projection(projection_mask);
+
+            let (target_offset, selection) = match read_mode {
+                ParquetReadMode::Sequential => (in_rg_offset, None),
+                ParquetReadMode::RowSelection => {
+                    let start = usize::try_from(in_rg_offset)
+                        .context("row offset within row group does not fit usize")?;
+                    if start >= row_group_rows {
+                        anyhow::bail!(
+                            "row offset {row_offset} is outside row group {rg_idx} with {row_group_rows} rows"
+                        );
+                    }
+                    let selection = RowSelection::from_consecutive_ranges(
+                        std::iter::once(start..start + 1),
+                        row_group_rows,
+                    );
+                    (0, Some(selection))
+                }
+            };
+
+            let mut reader = match read_mode {
+                ParquetReadMode::Sequential => builder.with_batch_size(1024).build()?,
+                ParquetReadMode::RowSelection => builder
+                    .with_row_selection(selection.expect("row-selection mode has a selection"))
+                    .with_row_selection_policy(RowSelectionPolicy::Selectors)
+                    .with_batch_size(1)
+                    .build()?,
+            };
 
             let mut seen = 0u64;
             while let Some(batch) = reader.next() {
                 let batch = batch?;
                 let batch_rows = batch.num_rows() as u64;
-                if in_rg_offset < seen.saturating_add(batch_rows) {
-                    let idx = (in_rg_offset - seen) as usize;
-                    let Some(col) = batch.column_by_name(&column) else {
-                        return Ok(0);
-                    };
+                if target_offset < seen.saturating_add(batch_rows) {
+                    let idx = (target_offset - seen) as usize;
+                    let col = batch
+                        .column_by_name(&column)
+                        .with_context(|| format!("column missing from projected batch: {column}"))?;
                     if col.is_null(idx) {
-                        return Ok(0);
+                        return Ok(BinaryRead::Null);
                     }
                     if let Some(bin) = col.as_any().downcast_ref::<LargeBinaryArray>() {
-                        return Ok(bin.value(idx).len());
+                        let value = bin.value(idx);
+                        return Ok(if materialize {
+                            BinaryRead::Value(value.to_vec())
+                        } else {
+                            BinaryRead::Length(value.len())
+                        });
                     }
                     if let Some(bin) = col.as_any().downcast_ref::<arrow_array::BinaryArray>() {
-                        return Ok(bin.value(idx).len());
+                        let value = bin.value(idx);
+                        return Ok(if materialize {
+                            BinaryRead::Value(value.to_vec())
+                        } else {
+                            BinaryRead::Length(value.len())
+                        });
                     }
-                    return Ok(0);
+                    anyhow::bail!("column {column} is not Binary or LargeBinary");
                 }
                 seen = seen.saturating_add(batch_rows);
             }
-            Ok(0)
+            anyhow::bail!("row offset {row_offset} was not returned by parquet reader")
         })
         .await?
     }
@@ -432,13 +668,32 @@ impl ParquetEngine {
             .unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
         let reader: Box<dyn RecordBatchReader + Send> =
             Box::new(TokioReceiverRecordBatchReader::new(schema, rx));
-        self.ingest(reader, out_path).await
+        self.ingest(reader, out_path, ParquetWriterOptions::default())
+            .await
     }
+}
+
+enum BinaryRead {
+    Null,
+    Length(usize),
+    Value(Vec<u8>),
 }
 
 impl OpenedParquetFile {
     pub fn row_count(&self) -> u64 {
         self.metadata.metadata().file_metadata().num_rows() as u64
+    }
+
+    pub fn row_group_count(&self) -> usize {
+        self.metadata.metadata().num_row_groups()
+    }
+
+    pub fn has_offset_index(&self) -> bool {
+        self.metadata.metadata().offset_index().is_some()
+    }
+
+    pub fn writer_profile(&self) -> ParquetWriterProfile {
+        self.writer_profile
     }
 }
 

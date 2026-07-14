@@ -604,6 +604,19 @@ impl LanceEngine {
         Ok(blob.read().await?.len())
     }
 
+    pub async fn read_blob_one_opened(
+        &self,
+        dataset: &Arc<Dataset>,
+        row_offset: u64,
+        column: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let blobs = dataset.take_blobs_by_indices(&[row_offset], column).await?;
+        let Some(blob) = blobs.first() else {
+            return Ok(None);
+        };
+        Ok(Some(blob.read().await?.to_vec()))
+    }
+
     pub async fn evolution_add_column_sql(
         &self,
         dataset_path: &Path,
